@@ -2,11 +2,13 @@
     LimparNavegadores.ps1  (arquivo unico)
 
     Modo normal (sem parametros):
-        Fecha Chrome, Firefox, Brave e Opera; apaga historico, cache,
-        cookies e senhas salvas; trava os navegadores por politica (modo
-        anonimo forcado, sem gerenciador de senha, sem login/sync); e
-        reaponta os atalhos (Area de trabalho, Menu Iniciar, barra de
-        tarefas) para chamar este MESMO arquivo em "modo lancador".
+        Fecha Chrome, Firefox, Brave, Opera, Edge e Internet Explorer;
+        apaga historico, cache, cookies e senhas salvas; trava os
+        navegadores por politica (modo anonimo/InPrivate forcado onde
+        suportado, sem gerenciador de senha, sem login/sync, pagina
+        inicial fixada no site da empresa); e reaponta os atalhos (Area de
+        trabalho, Menu Iniciar, barra de tarefas) para chamar este MESMO
+        arquivo em "modo lancador".
         Tambem deixa so 1 atalho oficial por navegador na Area de trabalho.
 
     Modo lancador (-Lancar, usado pelos atalhos, nao chame manualmente):
@@ -28,13 +30,47 @@ param(
 
     # --- parametros usados internamente pelos atalhos (modo lancador) ---
     [switch]$Lancar,
-    [string]$Navegador,    # 'firefox' ou 'chromium'
+    [string]$Navegador,    # 'firefox', 'chromium' (Chrome/Brave/Opera/Edge) ou 'iexplore'
     [string]$UserData,     # pasta "User Data" (Chromium)
     [string]$Exe,          # caminho do executavel a abrir
-    [string]$ArgsExtra     # ex: --incognito / --private
+    [string]$ArgsExtra     # ex: --incognito / --private / --inprivate
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
+
+# Pagina inicial fixada em todos os navegadores (site oficial, sem parametros
+# de campanha/anuncio -- esses expiram e nao devem virar homepage permanente)
+$PaginaInicial = 'https://www.pr.senac.br/principal/'
+
+# Prefs de bloqueio + homepage do Firefox -- usadas tanto no perfil ja
+# existente (modo normal, secao 3) quanto no perfil provisionado do zero
+# a cada abertura (modo lancador, para sobreviver ao apagamento do perfil)
+function Get-FirefoxPrefsLinhas {
+    @(
+        # limpa tudo ao fechar
+        'user_pref("privacy.sanitize.sanitizeOnShutdown", true);',
+        'user_pref("privacy.clearOnShutdown.history", true);',
+        'user_pref("privacy.clearOnShutdown.formdata", true);',
+        'user_pref("privacy.clearOnShutdown.downloads", true);',
+        'user_pref("privacy.clearOnShutdown.cookies", true);',
+        'user_pref("privacy.clearOnShutdown.cache", true);',
+        'user_pref("privacy.clearOnShutdown.sessions", true);',
+        'user_pref("privacy.clearOnShutdown.offlineApps", true);',
+        'user_pref("privacy.clearOnShutdown.siteSettings", false);',
+        # forca toda janela/aba nova a abrir em navegacao privada
+        'user_pref("browser.privatebrowsing.autostart", true);',
+        # desativa o gerenciador de senhas e autofill
+        'user_pref("signon.rememberSignons", false);',
+        'user_pref("signon.autofillForms", false);',
+        'user_pref("signon.generation.enabled", false);',
+        'user_pref("browser.formfill.enable", false);',
+        # desativa Firefox Sync / login de conta (senha nao volta da nuvem)
+        'user_pref("identity.fxaccounts.enabled", false);',
+        # pagina inicial fixa
+        "user_pref(`"browser.startup.homepage`", `"$PaginaInicial`");",
+        'user_pref("browser.startup.page", 1);'
+    )
+}
 
 # =============================================================================
 # MODO LANCADOR: apaga o perfil, abre o navegador, espera fechar, apaga de novo
@@ -42,12 +78,39 @@ $ErrorActionPreference = 'SilentlyContinue'
 if ($Lancar) {
 
     if ($Navegador -eq 'firefox') {
-        $firefoxAppData = Join-Path $env:APPDATA 'Mozilla\Firefox'
+        $firefoxRoot     = Join-Path $env:APPDATA 'Mozilla\Firefox'
+        $profilesDir     = Join-Path $firefoxRoot 'Profiles'
+        $nomePerfil      = 'efemero.default-release'
+        $perfilPath      = Join-Path $profilesDir $nomePerfil
+        $profilesIniPath = Join-Path $firefoxRoot 'profiles.ini'
 
         function Limpar-Firefox {
-            if (Test-Path $firefoxAppData) {
-                Remove-Item -Path $firefoxAppData -Recurse -Force
+            if (Test-Path $firefoxRoot) {
+                Remove-Item -Path $firefoxRoot -Recurse -Force
             }
+        }
+
+        function Provisionar-PerfilFirefox {
+            # recria um perfil ja travado (sem senha, privado forcado, com a
+            # homepage) do zero -- assim as regras nao se perdem quando a
+            # pasta inteira e apagada apos o fechamento anterior
+            New-Item -Path $perfilPath -ItemType Directory -Force | Out-Null
+
+            $profilesIni = @(
+                '[Profile0]'
+                'Name=default'
+                'IsRelative=1'
+                "Path=Profiles/$nomePerfil"
+                'Default=1'
+                ''
+                '[General]'
+                'StartWithLastProfile=1'
+                'Version=2'
+            )
+            Set-Content -Path $profilesIniPath -Value $profilesIni -Force
+
+            $prefsPath = Join-Path $perfilPath 'prefs.js'
+            Set-Content -Path $prefsPath -Value (Get-FirefoxPrefsLinhas) -Force
         }
 
         function Encontrar-FirefoxExe {
@@ -67,15 +130,42 @@ if ($Lancar) {
         }
 
         Limpar-Firefox
+        Provisionar-PerfilFirefox
         $firefoxExe = Encontrar-FirefoxExe
         if ($firefoxExe) {
-            $proc = Start-Process -FilePath $firefoxExe -ArgumentList '-private-window' -PassThru
+            $proc = Start-Process -FilePath $firefoxExe -PassThru
             $proc.WaitForExit()
         }
         Limpar-Firefox
     }
+    elseif ($Navegador -eq 'iexplore') {
+        # IE nao guarda os dados numa pasta de perfil propria (usa WinINet/
+        # Credential Manager compartilhados) -- limpa via RunDll32 antes e depois
+        function Limpar-IE {
+            Start-Process -FilePath 'RunDll32.exe' -ArgumentList 'InetCpl.cpl,ClearMyTracksByProcess 4351' -Wait
+        }
+
+        function Encontrar-IEExe {
+            $candidatos = @(
+                (Join-Path $env:ProgramFiles 'Internet Explorer\iexplore.exe')
+                (Join-Path ${env:ProgramFiles(x86)} 'Internet Explorer\iexplore.exe')
+            )
+            foreach ($c in $candidatos) {
+                if ($c -and (Test-Path $c)) { return $c }
+            }
+            return $null
+        }
+
+        Limpar-IE
+        $ieExe = Encontrar-IEExe
+        if ($ieExe) {
+            $proc = Start-Process -FilePath $ieExe -ArgumentList '-private' -PassThru
+            $proc.WaitForExit()
+        }
+        Limpar-IE
+    }
     else {
-        # Chromium: Chrome, Brave, Opera -- recebidos via -UserData / -Exe / -ArgsExtra
+        # Chromium: Chrome, Brave, Opera, Edge -- recebidos via -UserData / -Exe / -ArgsExtra
         function Limpar-PerfilChromium {
             if ($UserData -and (Test-Path $UserData)) {
                 Remove-Item -Path $UserData -Recurse -Force
@@ -126,10 +216,10 @@ function Write-Item($texto, $status = 'ok') {
 # 0. Confirmacao
 # ---------------------------------------------------------------------------
 if (-not $Silencioso) {
-    Write-Host "Este script vai FECHAR Chrome, Firefox, Brave e Opera," -ForegroundColor Yellow
-    Write-Host "apagar historico/cache/cookies/senhas salvas e reapontar os" -ForegroundColor Yellow
-    Write-Host "atalhos para que cada abertura seja como instalacao nova." -ForegroundColor Yellow
-    Write-Host "Sem backup." -ForegroundColor Yellow
+    Write-Host "Este script vai FECHAR Chrome, Firefox, Brave, Opera, Edge e" -ForegroundColor Yellow
+    Write-Host "Internet Explorer, apagar historico/cache/cookies/senhas salvas" -ForegroundColor Yellow
+    Write-Host "e reapontar os atalhos para que cada abertura seja como" -ForegroundColor Yellow
+    Write-Host "instalacao nova. Sem backup." -ForegroundColor Yellow
     $resp = Read-Host "Digite CONFIRMAR para continuar"
     if ($resp -ne 'CONFIRMAR') {
         Write-Host "Cancelado pelo usuario." -ForegroundColor Red
@@ -142,7 +232,7 @@ if (-not $Silencioso) {
 # ---------------------------------------------------------------------------
 Write-Secao "Fechando navegadores"
 
-$processos = @('chrome', 'firefox', 'brave', 'opera', 'opera_gx')
+$processos = @('chrome', 'firefox', 'brave', 'opera', 'opera_gx', 'msedge', 'iexplore')
 foreach ($p in $processos) {
     $procs = Get-Process -Name $p -ErrorAction SilentlyContinue
     if ($procs) {
@@ -155,7 +245,7 @@ foreach ($p in $processos) {
 Start-Sleep -Seconds 2
 
 # ---------------------------------------------------------------------------
-# 2. Definicao dos navegadores baseados em Chromium (Chrome, Brave, Opera)
+# 2. Definicao dos navegadores baseados em Chromium (Chrome, Brave, Opera, Edge)
 # ---------------------------------------------------------------------------
 $local = $env:LOCALAPPDATA
 $roaming = $env:APPDATA
@@ -178,6 +268,12 @@ $navegadoresChromium = @(
         UserData   = Join-Path $roaming 'Opera Software\Opera Stable'
         PolicyKey  = 'HKCU:\SOFTWARE\Policies\Opera Software\Opera'
         Executavel = Join-Path $local 'Programs\Opera\launcher.exe'
+    },
+    @{
+        Nome       = 'Microsoft Edge'
+        UserData   = Join-Path $local 'Microsoft\Edge\User Data'
+        PolicyKey  = 'HKCU:\SOFTWARE\Policies\Microsoft\Edge'
+        Executavel = Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'
     }
 )
 
@@ -185,7 +281,7 @@ $navegadoresChromium = @(
 $arquivosChromium = @('History', 'Cookies', 'Login Data', 'Login Data For Account', 'Web Data', 'Top Sites', 'Visited Links', 'Shortcuts')
 $pastasChromium   = @('Cache', 'Code Cache', 'GPUCache', 'Service Worker')
 
-Write-Secao "Limpando navegadores baseados em Chromium (Chrome, Brave, Opera)"
+Write-Secao "Limpando navegadores baseados em Chromium (Chrome, Brave, Opera, Edge)"
 
 foreach ($nav in $navegadoresChromium) {
     if (-not (Test-Path $nav.UserData)) {
@@ -233,8 +329,15 @@ foreach ($nav in $navegadoresChromium) {
             -Value $itensParaLimpar -PropertyType MultiString -Force | Out-Null
 
         # forca TODA janela a abrir em modo anonimo, nao importa por onde for aberta
-        New-ItemProperty -Path $nav.PolicyKey -Name 'IncognitoModeAvailability' `
-            -Value 2 -PropertyType DWord -Force | Out-Null
+        # (Edge nao tem opcao de "forcar" InPrivate, so permitir/desativar --
+        # o modo anonimo dele fica garantido pelo lancador da secao 4)
+        if ($nav.Nome -eq 'Microsoft Edge') {
+            New-ItemProperty -Path $nav.PolicyKey -Name 'InPrivateModeAvailability' `
+                -Value 0 -PropertyType DWord -Force | Out-Null
+        } else {
+            New-ItemProperty -Path $nav.PolicyKey -Name 'IncognitoModeAvailability' `
+                -Value 2 -PropertyType DWord -Force | Out-Null
+        }
 
         # desativa o gerenciador de senhas (nada mais fica salvo, nem se a pessoa clicar "salvar")
         New-ItemProperty -Path $nav.PolicyKey -Name 'PasswordManagerEnabled' `
@@ -253,13 +356,23 @@ foreach ($nav in $navegadoresChromium) {
             -Value 1 -PropertyType DWord -Force | Out-Null
 
         # apaga o perfil inteiro ao encerrar a sessao (defesa extra, alem do
-        # lancador da secao 4 que ja apaga a pasta User Data por completo)
+        # lancador da secao 5 que ja apaga a pasta User Data por completo)
         New-ItemProperty -Path $nav.PolicyKey -Name 'ForceEphemeralProfiles' `
             -Value 1 -PropertyType DWord -Force | Out-Null
-        New-ItemProperty -Path $nav.PolicyKey -Name 'RestoreOnStartup' `
-            -Value 5 -PropertyType DWord -Force | Out-Null
 
-        Write-Item "$($nav.Nome): travado (modo anonimo forcado, perfil efemero, sem gerenciador de senha, sem login/sync)"
+        # pagina inicial fixa: abre nela ao iniciar e no botao "Pagina inicial"
+        New-ItemProperty -Path $nav.PolicyKey -Name 'RestoreOnStartup' `
+            -Value 4 -PropertyType DWord -Force | Out-Null
+        New-ItemProperty -Path $nav.PolicyKey -Name 'RestoreOnStartupURLs' `
+            -Value @($PaginaInicial) -PropertyType MultiString -Force | Out-Null
+        New-ItemProperty -Path $nav.PolicyKey -Name 'HomepageLocation' `
+            -Value $PaginaInicial -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $nav.PolicyKey -Name 'HomepageIsNewTabPage' `
+            -Value 0 -PropertyType DWord -Force | Out-Null
+        New-ItemProperty -Path $nav.PolicyKey -Name 'ShowHomeButton' `
+            -Value 1 -PropertyType DWord -Force | Out-Null
+
+        Write-Item "$($nav.Nome): travado (modo anonimo forcado, perfil efemero, sem gerenciador de senha, sem login/sync, homepage fixa)"
     } catch {
         Write-Item "$($nav.Nome): nao foi possivel aplicar todas as politicas de bloqueio" 'warn'
     }
@@ -292,34 +405,14 @@ if (Test-Path $firefoxProfilesDir) {
             }
         }
 
-        # ---- trava o perfil via prefs.js ----
+        # ---- trava o perfil via prefs.js (mesma funcao usada pelo lancador) ----
         $prefsPath = Join-Path $perfil.FullName 'prefs.js'
-        $prefsLimpeza = @(
-            # limpa tudo ao fechar
-            'user_pref("privacy.sanitize.sanitizeOnShutdown", true);',
-            'user_pref("privacy.clearOnShutdown.history", true);',
-            'user_pref("privacy.clearOnShutdown.formdata", true);',
-            'user_pref("privacy.clearOnShutdown.downloads", true);',
-            'user_pref("privacy.clearOnShutdown.cookies", true);',
-            'user_pref("privacy.clearOnShutdown.cache", true);',
-            'user_pref("privacy.clearOnShutdown.sessions", true);',
-            'user_pref("privacy.clearOnShutdown.offlineApps", true);',
-            'user_pref("privacy.clearOnShutdown.siteSettings", false);',
-            # forca toda janela/aba nova a abrir em navegacao privada
-            'user_pref("browser.privatebrowsing.autostart", true);',
-            # desativa o gerenciador de senhas e autofill
-            'user_pref("signon.rememberSignons", false);',
-            'user_pref("signon.autofillForms", false);',
-            'user_pref("signon.generation.enabled", false);',
-            'user_pref("browser.formfill.enable", false);',
-            # desativa Firefox Sync / login de conta (senha nao volta da nuvem)
-            'user_pref("identity.fxaccounts.enabled", false);'
-        )
+        $prefsLimpeza = Get-FirefoxPrefsLinhas
 
         $conteudoAtual = @()
         if (Test-Path $prefsPath) {
             $conteudoAtual = Get-Content -Path $prefsPath -ErrorAction SilentlyContinue |
-                Where-Object { $_ -notmatch 'privacy\.(sanitize\.sanitizeOnShutdown|clearOnShutdown\.)|browser\.privatebrowsing\.autostart|signon\.(rememberSignons|autofillForms|generation\.enabled)|browser\.formfill\.enable|identity\.fxaccounts\.enabled' }
+                Where-Object { $_ -notmatch 'privacy\.(sanitize\.sanitizeOnShutdown|clearOnShutdown\.)|browser\.privatebrowsing\.autostart|signon\.(rememberSignons|autofillForms|generation\.enabled)|browser\.formfill\.enable|identity\.fxaccounts\.enabled|browser\.startup\.(homepage|page)' }
         }
         $novoConteudo = $conteudoAtual + $prefsLimpeza
         Set-Content -Path $prefsPath -Value $novoConteudo -Force -ErrorAction SilentlyContinue
@@ -327,7 +420,7 @@ if (Test-Path $firefoxProfilesDir) {
 
     if ($perfisFirefox) {
         Write-Item "Firefox: historico, cookies, cache e senhas apagados ($($perfisFirefox.Count) perfil(is))"
-        Write-Item "Firefox: travado (navegacao privada forcada, sem gerenciador de senha, sem sync)"
+        Write-Item "Firefox: travado (navegacao privada forcada, sem gerenciador de senha, sem sync, homepage fixa)"
     } else {
         Write-Item "Firefox: nenhum perfil encontrado" 'skip'
     }
@@ -336,7 +429,54 @@ if (Test-Path $firefoxProfilesDir) {
 }
 
 # ---------------------------------------------------------------------------
-# 4. Atalhos (Area de trabalho, Menu Iniciar, Barra de tarefas)
+# 4. Internet Explorer
+# ---------------------------------------------------------------------------
+Write-Secao "Limpando Internet Explorer"
+
+$ieInstalado = (Test-Path (Join-Path $env:ProgramFiles 'Internet Explorer\iexplore.exe')) `
+    -or (Test-Path (Join-Path ${env:ProgramFiles(x86)} 'Internet Explorer\iexplore.exe'))
+
+if ($ieInstalado) {
+    # IE nao usa pastas de perfil como Chromium/Firefox: historico, cookies,
+    # cache, senhas e dados de formulario ficam no WinINet e no Credential
+    # Manager do Windows. RunDll32 InetCpl.cpl e o jeito suportado de limpar
+    # tudo isso (4351 = historico + cookies + cache + senhas + formularios).
+    try {
+        Start-Process -FilePath 'RunDll32.exe' -ArgumentList 'InetCpl.cpl,ClearMyTracksByProcess 4351' -Wait
+        Write-Item "Internet Explorer: historico, cookies, cache, senhas e formularios apagados"
+    } catch {
+        Write-Item "Internet Explorer: falha ao limpar dados (RunDll32 InetCpl.cpl)" 'warn'
+    }
+
+    # ---- trava: limpa automaticamente ao fechar ----
+    try {
+        $iePolicyKey = 'HKCU:\Software\Policies\Microsoft\Internet Explorer\Privacy'
+        if (-not (Test-Path $iePolicyKey)) {
+            New-Item -Path $iePolicyKey -Force | Out-Null
+        }
+        New-ItemProperty -Path $iePolicyKey -Name 'ClearBrowsingHistoryOnExit' `
+            -Value 1 -PropertyType DWord -Force | Out-Null
+        Write-Item "Internet Explorer: configurado para limpar historico ao fechar"
+    } catch {
+        Write-Item "Internet Explorer: nao foi possivel aplicar a politica de limpeza automatica" 'warn'
+    }
+
+    # ---- pagina inicial fixa ----
+    try {
+        $ieMainKey = 'HKCU:\Software\Microsoft\Internet Explorer\Main'
+        if (-not (Test-Path $ieMainKey)) { New-Item -Path $ieMainKey -Force | Out-Null }
+        New-ItemProperty -Path $ieMainKey -Name 'Start Page' -Value $PaginaInicial -PropertyType String -Force | Out-Null
+
+        Write-Item "Internet Explorer: pagina inicial fixada"
+    } catch {
+        Write-Item "Internet Explorer: nao foi possivel fixar a pagina inicial" 'warn'
+    }
+} else {
+    Write-Item "Internet Explorer nao encontrado" 'skip'
+}
+
+# ---------------------------------------------------------------------------
+# 5. Atalhos (Area de trabalho, Menu Iniciar, Barra de tarefas)
 #    -> reapontar para ESTE MESMO arquivo em modo lancador (-Lancar)
 # ---------------------------------------------------------------------------
 Write-Secao "Reapontando atalhos para o modo lancador de perfil efemero"
@@ -360,10 +500,11 @@ $shell = New-Object -ComObject WScript.Shell
 
 # nome do executavel -> pasta "User Data" do navegador (Chromium) e flag de modo privado
 $userDataPorExe = @{
-    'chrome.exe'   = @{ UserData = ($navegadoresChromium | Where-Object Nome -eq 'Google Chrome').UserData; Flag = '--incognito' }
-    'brave.exe'    = @{ UserData = ($navegadoresChromium | Where-Object Nome -eq 'Brave').UserData;         Flag = '--incognito' }
-    'opera.exe'    = @{ UserData = ($navegadoresChromium | Where-Object Nome -eq 'Opera').UserData;         Flag = '--private' }
-    'launcher.exe' = @{ UserData = ($navegadoresChromium | Where-Object Nome -eq 'Opera').UserData;         Flag = '--private' }
+    'chrome.exe'   = @{ UserData = ($navegadoresChromium | Where-Object Nome -eq 'Google Chrome').UserData;  Flag = '--incognito' }
+    'brave.exe'    = @{ UserData = ($navegadoresChromium | Where-Object Nome -eq 'Brave').UserData;          Flag = '--incognito' }
+    'opera.exe'    = @{ UserData = ($navegadoresChromium | Where-Object Nome -eq 'Opera').UserData;          Flag = '--private' }
+    'launcher.exe' = @{ UserData = ($navegadoresChromium | Where-Object Nome -eq 'Opera').UserData;          Flag = '--private' }
+    'msedge.exe'   = @{ UserData = ($navegadoresChromium | Where-Object Nome -eq 'Microsoft Edge').UserData; Flag = '--inprivate' }
 }
 
 foreach ($pasta in $pastasAtalhos) {
@@ -378,17 +519,28 @@ foreach ($pasta in $pastasAtalhos) {
 
             if ($exeNome -eq 'firefox.exe') {
                 $atalho.TargetPath   = $pwshPath
-                $atalho.Arguments    = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -Lancar -Navegador firefox"
+                $atalho.Arguments    = "-WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`" -Lancar -Navegador firefox"
                 $atalho.IconLocation = "$alvo,0"
+                $atalho.WindowStyle  = 7   # inicia minimizado -> evita o "flash" da janela do PowerShell
                 $atalho.Save()
                 $atalhosAlterados++
                 Write-Item "Atalho '$($lnk.Name)' -> reapontado para lancador efemero do Firefox"
             }
+            elseif ($exeNome -eq 'iexplore.exe') {
+                $atalho.TargetPath   = $pwshPath
+                $atalho.Arguments    = "-WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`" -Lancar -Navegador iexplore"
+                $atalho.IconLocation = "$alvo,0"
+                $atalho.WindowStyle  = 7
+                $atalho.Save()
+                $atalhosAlterados++
+                Write-Item "Atalho '$($lnk.Name)' -> reapontado para lancador efemero do Internet Explorer"
+            }
             elseif ($userDataPorExe.ContainsKey($exeNome) -and $userDataPorExe[$exeNome].UserData) {
                 $info = $userDataPorExe[$exeNome]
                 $atalho.TargetPath   = $pwshPath
-                $atalho.Arguments    = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -Lancar -Navegador chromium -UserData `"$($info.UserData)`" -Exe `"$alvo`" -ArgsExtra `"$($info.Flag)`""
+                $atalho.Arguments    = "-WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`" -Lancar -Navegador chromium -UserData `"$($info.UserData)`" -Exe `"$alvo`" -ArgsExtra `"$($info.Flag)`""
                 $atalho.IconLocation = "$alvo,0"
+                $atalho.WindowStyle  = 7
                 $atalho.Save()
                 $atalhosAlterados++
                 Write-Item "Atalho '$($lnk.Name)' -> reapontado para lancador efemero ($exeNome)"
@@ -406,7 +558,7 @@ if ($atalhosAlterados -eq 0) {
 [Runtime.Interopservices.Marshal]::ReleaseComObject($shell) | Out-Null
 
 # ---------------------------------------------------------------------------
-# 5. Area de trabalho: manter apenas 1 atalho oficial por navegador
+# 6. Area de trabalho: manter apenas 1 atalho oficial por navegador
 # ---------------------------------------------------------------------------
 Write-Secao "Deixando so um atalho oficial por navegador na Area de trabalho"
 
@@ -421,6 +573,8 @@ $nomesOficiais = @{
     'opera.exe'    = 'Opera.lnk'
     'launcher.exe' = 'Opera.lnk'
     'firefox.exe'  = 'Mozilla Firefox.lnk'
+    'msedge.exe'   = 'Microsoft Edge.lnk'
+    'iexplore.exe' = 'Internet Explorer.lnk'
 }
 
 $shell2 = New-Object -ComObject WScript.Shell
@@ -433,7 +587,7 @@ foreach ($pasta in $pastasDesktopUnico) {
         try {
             $atalho = $shell2.CreateShortcut($lnk.FullName)
 
-            # identifica o navegador pelo icone original (preservado na secao 4)
+            # identifica o navegador pelo icone original (preservado na secao 5)
             # ou, se nao tiver sido reapontado, pelo proprio alvo do atalho
             $origem = $null
             if ($atalho.IconLocation) {
@@ -474,15 +628,20 @@ if ($duplicadosRemovidos -eq 0) {
 }
 
 # ---------------------------------------------------------------------------
-# 6. Resumo
+# 7. Resumo
 # ---------------------------------------------------------------------------
 Write-Secao "Concluido"
 Write-Host "Historico, cache, cookies e senhas foram apagados agora (sem backup)." -ForegroundColor Green
 Write-Host "Politicas de bloqueio aplicadas no Chrome/Brave/Opera: modo anonimo" -ForegroundColor Green
 Write-Host "forcado, perfil efemero (ForceEphemeralProfiles), gerenciador de senha" -ForegroundColor Green
 Write-Host "e autofill desativados, login de conta/sync bloqueado." -ForegroundColor Green
+Write-Host "Edge: mesmas politicas de bloqueio (InPrivate nao suporta modo forcado" -ForegroundColor Green
+Write-Host "nativo, mas o lancador da secao 5 ja garante isso)." -ForegroundColor Green
 Write-Host "Firefox: navegacao privada forcada por preferencia, gerenciador de senha" -ForegroundColor Green
 Write-Host "e autofill desativados, Firefox Sync desativado." -ForegroundColor Green
+Write-Host "Internet Explorer: historico/cookies/cache/senhas apagados agora e" -ForegroundColor Green
+Write-Host "configurado para limpar automaticamente ao fechar." -ForegroundColor Green
+Write-Host "Pagina inicial fixada em todos os navegadores: $PaginaInicial" -ForegroundColor Green
 Write-Host "Atalhos (Area de trabalho, Menu Iniciar, barra de tarefas) reapontados" -ForegroundColor Green
 Write-Host "para o modo lancador deste mesmo arquivo: $atalhosAlterados" -ForegroundColor Green
 Write-Host "Area de trabalho: mantido so 1 atalho oficial por navegador; duplicados" -ForegroundColor Green
@@ -503,3 +662,7 @@ Write-Host "abrir o navegador de outro jeito (ex: clicar direto no chrome.exe/" 
 Write-Host "firefox.exe dentro da pasta de instalacao), o lancador e pulado - so" -ForegroundColor DarkYellow
 Write-Host "as politicas de registro (modo anonimo forcado, sem senha, sem sync)" -ForegroundColor DarkYellow
 Write-Host "continuam valendo." -ForegroundColor DarkYellow
+Write-Host ""
+Write-Host "Rodou este script antes da versao atual? Rode de novo uma vez -- os" -ForegroundColor DarkYellow
+Write-Host "atalhos sao reconfigurados com -WindowStyle 7 (minimizado), o que" -ForegroundColor DarkYellow
+Write-Host "elimina o 'flash' de janela do PowerShell ao clicar no atalho." -ForegroundColor DarkYellow
